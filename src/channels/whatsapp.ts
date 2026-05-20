@@ -157,6 +157,64 @@ function formatWhatsApp(text: string): string {
   return segments.map(({ content, isProtected }) => (isProtected ? content : transformForWhatsApp(content))).join('');
 }
 
+/**
+ * Subset of a normalized Baileys message content carrying the message
+ * types that can host a `contextInfo.mentionedJid` array. Kept as a
+ * structural type so the helper (and its tests) don't pull in the full
+ * `proto.IMessage` shape just to construct fixtures.
+ */
+type MentionContextSource = {
+  extendedTextMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+  imageMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+  videoMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+  documentMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+};
+
+/**
+ * Detect an explicit @-mention of the bot in a WhatsApp group message.
+ * WhatsApp carries mentions in `contextInfo.mentionedJid` on the text +
+ * caption-bearing message types. Matches against both the bot's phone
+ * JID and LID — most modern clients emit the LID even when the human
+ * typed a phone-number mention.
+ *
+ * Exported for unit testing. The inbound construction site calls this
+ * to set `InboundMessage.isMention` for group messages (#2560). DMs are
+ * unconditionally mentions and don't go through this helper.
+ */
+export function isBotMentionedInGroup(
+  normalized: MentionContextSource,
+  botPhoneJid: string | undefined,
+  botLidUser: string | undefined,
+): boolean {
+  if (!botPhoneJid && !botLidUser) return false;
+  const mentionedJids: string[] = [
+    ...(normalized.extendedTextMessage?.contextInfo?.mentionedJid ?? []),
+    ...(normalized.imageMessage?.contextInfo?.mentionedJid ?? []),
+    ...(normalized.videoMessage?.contextInfo?.mentionedJid ?? []),
+    ...(normalized.documentMessage?.contextInfo?.mentionedJid ?? []),
+  ];
+  const botLidJid = botLidUser ? `${botLidUser}@lid` : undefined;
+  return mentionedJids.some((jid) => {
+    if (!jid) return false;
+    const bare = jid.split(':')[0];
+    return bare === botPhoneJid || bare === botLidJid;
+  });
+}
+
+/**
+ * Compute `InboundMessage.isMention` for a WhatsApp message:
+ *   - DMs are always mentions (router auto-engages on the bot's behalf).
+ *   - Group messages are mentions only when the bot is explicitly tagged.
+ *
+ * Returns `true | undefined` rather than `true | false` because the
+ * `InboundMessage` field is `isMention?: boolean` and downstream code
+ * treats `undefined` differently than an explicit `false` (#2560).
+ */
+export function computeIsMention(isGroup: boolean, botMentionedInGroup: boolean): true | undefined {
+  if (!isGroup) return true;
+  return botMentionedInGroup ? true : undefined;
+}
+
 /** Map file extension to Baileys media message type. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?: string): any {
@@ -613,14 +671,21 @@ registerChannelAdapter('whatsapp', {
               }
             }
 
+            // Detect explicit @-mentions of the bot in groups. Detail in
+            // isBotMentionedInGroup(); short version is contextInfo.mentionedJid
+            // on text + caption-bearing messages, matched against the bot's
+            // phone JID and LID (#2560).
+            const botMentionedInGroup = isGroup && isBotMentionedInGroup(normalized, botPhoneJid, botLidUser);
+
             const inbound: InboundMessage = {
               id: msg.key.id || `wa-${Date.now()}`,
               kind: 'chat',
               // DMs are addressed to the bot by definition. Mark them as
               // platform-confirmed mentions so the router auto-creates an
               // approval-required messaging_group when the chat is unknown,
-              // instead of silently dropping.
-              isMention: !isGroup ? true : undefined,
+              // instead of silently dropping. In groups, only an explicit
+              // @-mention counts.
+              isMention: computeIsMention(isGroup, botMentionedInGroup),
               isGroup,
               content: {
                 text: content,
