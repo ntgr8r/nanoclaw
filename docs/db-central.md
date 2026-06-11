@@ -307,6 +307,7 @@ CREATE TABLE container_configs (
   image_tag              TEXT,
   assistant_name         TEXT,
   max_messages_per_prompt INTEGER,
+  idle_timeout_ms        INTEGER,                         -- idle-exit window (ms); NULL/0 = disabled
   skills                 TEXT NOT NULL DEFAULT '"all"',
   mcp_servers            TEXT NOT NULL DEFAULT '{}',
   packages_apt           TEXT NOT NULL DEFAULT '[]',
@@ -341,6 +342,7 @@ Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMig
 | 009 | `009-drop-pending-credentials.ts` | Drop the defunct `pending_credentials` table |
 | 014 | `014-container-configs.ts` | `container_configs` — per-agent-group container runtime config |
 | 015 | `015-cli-scope.ts` | `ALTER TABLE container_configs ADD COLUMN cli_scope` |
+| 016 | `016-container-idle-timeout.ts` | `ALTER TABLE container_configs ADD COLUMN idle_timeout_ms` |
 
 Numbers 005 and 006 are intentionally absent — migrations were renumbered during early development.
 

@@ -41,6 +41,8 @@ export interface ContainerConfig {
   assistantName?: string;
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
+  /** Idle window in ms after which an idle container exits cleanly. Unset/0 = disabled. */
+  idleTimeoutMs?: number;
   model?: string;
   effort?: string;
 }
@@ -61,6 +63,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
+    idleTimeoutMs: row.idle_timeout_ms ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
   };

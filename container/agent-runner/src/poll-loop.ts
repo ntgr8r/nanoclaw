@@ -4,6 +4,8 @@ import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { loadConfig } from './config.js';
+import { createIdleTracker } from './idle-tracker.js';
 import {
   formatMessages,
   extractRouting,
@@ -104,6 +106,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
 
+  // Idle exit: when the group's container config sets idle_timeout_ms, an
+  // idle container exits 0 after the window elapses instead of riding until
+  // host-sweep's absolute ceiling kills it. Unset/0 = disabled (default).
+  const { idleTimeoutMs } = loadConfig();
+  const idle = createIdleTracker(idleTimeoutMs);
+
   let pollCount = 0;
   let isFirstPoll = true;
   while (true) {
@@ -118,6 +126,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
+      if (idle.shouldExit()) {
+        log(`Idle timeout (${idleTimeoutMs}ms) — exiting`);
+        process.exit(0);
+      }
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -232,7 +244,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(query, routing, processingIds, config.providerName, idleTimeoutMs);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -266,6 +278,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
+    idle.markActivity();
     log(`Completed ${ids.length} message(s)`);
   }
 }
@@ -313,6 +326,7 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  idleTimeoutMs: number = 0,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -454,8 +468,9 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        let hasUnwrapped = false;
         if (event.text) {
-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          ({ hasUnwrapped } = dispatchResultText(event.text, routing));
           if (hasUnwrapped && !unwrappedNudged) {
             unwrappedNudged = true;
             const destinations = getAllDestinations();
@@ -467,6 +482,13 @@ async function processQuery(
                 `Please re-send your response with the correct wrapping.</system>`,
             );
           }
+        }
+        // When idleTimeoutMs is set, end the stream once the turn completes
+        // so the outer loop can evaluate the idle window. Skipped while the
+        // turn's output was unwrapped — the re-send nudge pushed above needs
+        // the stream to stay open for the corrected response.
+        if (idleTimeoutMs > 0 && !hasUnwrapped) {
+          query.end();
         }
       }
     }
