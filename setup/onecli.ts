@@ -103,6 +103,50 @@ function writeEnvOnecliUrl(url: string): void {
   writeEnvVar('ONECLI_URL', url);
 }
 
+function dockerPublishesPort(port: number): boolean {
+  try {
+    const out = execFileSync('docker', ['ps', '--format', '{{.Ports}}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out
+      .split('\n')
+      .some((line) => line.includes(`:${port}->`) || line.includes(`:${port}/`));
+  } catch {
+    return false;
+  }
+}
+
+function tcpPortInUse(port: number): boolean {
+  try {
+    const out = execSync(`ss -tln "sport = :${port}"`, {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.includes('LISTEN');
+  } catch {
+    return false;
+  }
+}
+
+function findAvailablePort(start: number): number {
+  for (let port = start; port < start + 100; port += 1) {
+    if (!tcpPortInUse(port) && !dockerPublishesPort(port)) return port;
+  }
+  return start;
+}
+
+function configureOnecliPostgresPort(): void {
+  if (process.env.POSTGRES_PORT?.trim()) return;
+
+  const defaultPort = 5432;
+  if (!tcpPortInUse(defaultPort) && !dockerPublishesPort(defaultPort)) return;
+
+  const port = findAvailablePort(5433);
+  process.env.POSTGRES_PORT = String(port);
+  log.info('OneCLI Postgres port 5432 is busy; using alternate port', { port });
+}
+
 // The SANCTIONED gateway version: fresh installs pin to it. Upgrading an
 // existing gateway is NOT done here — the gateway is a separate out-of-band
 // component, and the migrator is the user's coding agent following
@@ -395,6 +439,7 @@ export async function run(args: string[]): Promise<void> {
   }
 
   log.info('Installing OneCLI gateway and CLI');
+  configureOnecliPostgresPort();
   const res = installOnecli();
   if (!res.ok) {
     emitStatus('ONECLI', {

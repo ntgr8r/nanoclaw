@@ -20,6 +20,58 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [bootstrap] $*" >> "$LOG_FILE"; }
 
+package_manager_version() {
+  grep -E '"packageManager"' "$PROJECT_ROOT/package.json" 2>/dev/null \
+    | head -1 \
+    | sed -E 's/.*"pnpm@([^"]+)".*/\1/'
+}
+
+install_pnpm_via_npm() {
+  command -v npm >/dev/null 2>&1 || return 1
+
+  local pinned
+  pinned=$(package_manager_version)
+  [ -z "$pinned" ] && pinned="latest"
+
+  log "Installing pnpm@${pinned} via npm"
+  npm install -g "pnpm@${pinned}" >> "$LOG_FILE" 2>&1 \
+    || ([ "$PLATFORM" = "linux" ] && command -v sudo >/dev/null 2>&1 \
+          && sudo npm install -g "pnpm@${pinned}" >> "$LOG_FILE" 2>&1)
+}
+
+add_npm_prefix_to_path() {
+  command -v npm >/dev/null 2>&1 || return 0
+
+  local npm_prefix
+  npm_prefix=$(npm config get prefix 2>/dev/null)
+  if [ -n "$npm_prefix" ] && [ -x "$npm_prefix/bin/pnpm" ]; then
+    export PATH="$npm_prefix/bin:$PATH"
+    log "Prepended npm prefix bin to PATH: $npm_prefix/bin"
+  fi
+}
+
+run_with_retries() {
+  local label=$1
+  local attempts=$2
+  shift 2
+
+  local attempt rc
+  for attempt in $(seq 1 "$attempts"); do
+    log "${label} (attempt ${attempt}/${attempts})"
+    if "$@" >> "$LOG_FILE" 2>&1; then
+      return 0
+    fi
+
+    rc=$?
+    if [ "$attempt" -lt "$attempts" ]; then
+      log "${label} failed with exit ${rc}; retrying after ${attempt}s"
+      sleep "$attempt"
+    fi
+  done
+
+  return "$rc"
+}
+
 # --- Platform detection ---
 
 detect_platform() {
@@ -108,16 +160,7 @@ install_deps() {
   # distro packages) don't include corepack. Install pnpm directly at the
   # version pinned via package.json's `packageManager` field.
   if ! command -v pnpm >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    local pinned
-    pinned=$(grep -E '"packageManager"' "$PROJECT_ROOT/package.json" 2>/dev/null \
-      | head -1 \
-      | sed -E 's/.*"pnpm@([^"]+)".*/\1/')
-    [ -z "$pinned" ] && pinned="latest"
-    log "Installing pnpm@${pinned} via npm"
-    npm install -g "pnpm@${pinned}" >> "$LOG_FILE" 2>&1 \
-      || ([ "$PLATFORM" = "linux" ] && command -v sudo >/dev/null 2>&1 \
-            && sudo npm install -g "pnpm@${pinned}" >> "$LOG_FILE" 2>&1) \
-      || true
+    install_pnpm_via_npm || true
   fi
 
   # `npm install -g` writes to npm's global prefix, which isn't always on the
@@ -126,12 +169,7 @@ install_deps() {
   # PATH. Discover the prefix and prepend its bin dir so `command -v pnpm`
   # sees the new install.
   if ! command -v pnpm >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    local npm_prefix
-    npm_prefix=$(npm config get prefix 2>/dev/null)
-    if [ -n "$npm_prefix" ] && [ -x "$npm_prefix/bin/pnpm" ]; then
-      export PATH="$npm_prefix/bin:$PATH"
-      log "Prepended npm prefix bin to PATH: $npm_prefix/bin"
-    fi
+    add_npm_prefix_to_path
   fi
 
   if ! command -v pnpm >/dev/null 2>&1; then
@@ -139,8 +177,17 @@ install_deps() {
     return
   fi
 
+  # `command -v pnpm` may point at a Corepack shim that still needs to fetch
+  # pnpm on first use. If that fetch times out, fall back to npm-installed pnpm
+  # before running the larger dependency install.
+  if ! run_with_retries "Checking pnpm availability" 3 pnpm --version; then
+    log "pnpm shim failed; retrying with npm-installed pnpm"
+    install_pnpm_via_npm || true
+    add_npm_prefix_to_path
+  fi
+
   log "Running pnpm install --frozen-lockfile"
-  if pnpm install --frozen-lockfile >> "$LOG_FILE" 2>&1; then
+  if run_with_retries "pnpm install --frozen-lockfile" 3 pnpm install --frozen-lockfile; then
     DEPS_OK="true"
     log "pnpm install succeeded"
   else
